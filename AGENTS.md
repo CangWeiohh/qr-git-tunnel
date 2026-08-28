@@ -11,6 +11,14 @@ Git / IDEA ──HTTP──> A proxy ──剪贴板 QRT:b64:──> B tunnel �
                           <────── 屏幕二维码（多 QR 网格）──────────┘
 ```
 
+## 开发仓库约定（重要）
+
+- **今后二维码传输方案的唯一开发、测试、提交和发布仓库**：`/Users/cangwei/Personal.localized/develop/github/qr-git-tunnel`
+- GitHub 远程：`https://github.com/CangWeiohh/qr-git-tunnel.git`，默认分支为 `main`
+- 旧目录 `/Users/cangwei/Personal.localized/develop/python/qrtunnel` 仅作为历史本地副本和备份保留：**不再在其中开发、修改、提交或生成新的交付版本**
+- 如果收到涉及二维码传输方案的开发任务，默认进入本仓库；如需参考旧目录，只读对照即可，完成后应把改动落在本仓库
+- 新版本应从本仓库提交、测试并生成部署包；不要把旧目录当作源目录，也不要把旧目录中的 `backup/` 当作当前开发输出目录
+
 ## 最重要的约束（改代码前必须懂）
 
 1. **剪贴板严格单向 A→B**：云桌面策略下 B 端写剪贴板不会同步回 A（B→A 剪贴板被禁）。所以 **B 端代码绝不写剪贴板**（审计断言：`SetClipboardData`/`EmptyClipboard`/`GlobalAlloc` 在 b_tunnel.py 中禁止出现，`tests/test_upgrade.py::test_invariants` 会检查）。B→A 的唯一信道是屏幕二维码，必须用 zxing-cpp 解码。

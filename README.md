@@ -18,6 +18,25 @@
 
 **使用方式**：AI 工具在本仓库上做任何分析、改代码、排查问题之前，先读取 `AGENTS.md`；人类新接手者也可先读它快速建立全貌，再按需查阅下文各章节与 `a_end/`、`b_end/` 源码。修改协议、帧流程、启动脚本或配置字段时尤其要遵守其中的约束，避免重蹈历史事故（B 端误写剪贴板、二进制页误用 `b.text`、VERSION 失同步等）。
 
+## 开发仓库约定（重要）
+
+今后二维码传输方案的**唯一开发、测试、提交、发布和生成部署包的仓库**是：
+
+```text
+/Users/cangwei/Personal.localized/develop/github/qr-git-tunnel
+```
+
+对应 GitHub 仓库为 [CangWeiohh/qr-git-tunnel](https://github.com/CangWeiohh/qr-git-tunnel)，默认分支为 `main`。
+
+旧目录 `/Users/cangwei/Personal.localized/develop/python/qrtunnel` 仅作为历史本地副本和备份保留：
+
+- 不再在旧目录中开发、修改或提交代码
+- 不再从旧目录生成新的对外交付版本
+- 如需查阅历史实现，只读对照即可
+- 所有新改动、测试、提交和部署包都必须从本仓库产生
+
+如果 AI 工具收到二维码传输方案的开发任务，应直接进入本仓库，不要继续使用旧的 `/develop/python/qrtunnel` 目录。
+
 ---
 
 ## 它是怎么工作的
