@@ -213,12 +213,12 @@ qr-git-tunnel/
 **1.1 在本机（Windows 物理机）下载离线包：**
 
 ```powershell
-mkdir C:\qrtunnel-offline
-cd C:\qrtunnel-offline
+mkdir C:\qr-git-tunnel-offline
+cd C:\qr-git-tunnel-offline
 
 # 下载 Python 3.11+ x64 安装包
 # 浏览器打开 https://www.python.org/downloads/windows/
-# 下载 "Windows installer (64-bit)"，放到 C:\qrtunnel-offline\
+# 下载 "Windows installer (64-bit)"，放到 C:\qr-git-tunnel-offline\
 
 # 下载依赖包（本机是 x64，直接 pip download）
 pip download qrcode pillow pywin32 -d .
@@ -227,7 +227,7 @@ pip download qrcode pillow pywin32 -d .
 **1.2 把离线包和 B 端代码拷进云桌面：**
 
 把以下内容从本机拷进云桌面（比如拷到桌面同一个目录）:
-- `C:\qrtunnel-offline\` 整个文件夹（含 Python 安装包和 pip 依赖包）
+- `C:\qr-git-tunnel-offline\` 整个文件夹（含 Python 安装包和 pip 依赖包）
 - 根目录 `config.yaml`、`start_b.bat`
 - `b_end/` 文件夹（含 `b_tunnel.py`、`requirements.txt`）
 
@@ -247,7 +247,7 @@ pip download qrcode pillow pywin32 -d .
 **1.4 在云桌面安装依赖（离线安装，不联网）：**
 
 ```powershell
-cd C:\Users\<你的用户名>\Desktop\qrtunnel-offline
+cd C:\Users\<你的用户名>\Desktop\qr-git-tunnel-offline
 pip install --no-index --find-links=. qrcode pillow pywin32
 ```
 
@@ -256,7 +256,7 @@ pip install --no-index --find-links=. qrcode pillow pywin32
 **1.5 启动 B 端：**
 
 ```powershell
-cd C:\Users\<你的用户名>\Desktop\qrtunnel
+cd C:\Users\<你的用户名>\Desktop\qr-git-tunnel
 start_b.bat
 ```
 
@@ -272,12 +272,12 @@ start_b.bat
 
 **2.2 拷贝 A 端代码和启动文件：**
 
-先把本仓库根目录的 `config.yaml`、`start_a.bat` 与 `a_end/` 文件夹一起拷到本机同一个目录（例如 `C:\qrtunnel\`），保持 `a_end\\a_proxy.py` 的相对路径。默认配置适用于拓扑 B；拓扑 A 请把 `a_listen` 改为 `127.0.0.1:9999`，并按本机 Python 修改 `a_python`。
+先把本仓库根目录的 `config.yaml`、`start_a.bat` 与 `a_end/` 文件夹一起拷到本机同一个目录（例如 `C:\qr-git-tunnel\`），保持 `a_end\\a_proxy.py` 的相对路径。默认配置适用于拓扑 B；拓扑 A 请把 `a_listen` 改为 `127.0.0.1:9999`，并按本机 Python 修改 `a_python`。
 
 **2.3 安装依赖：**
 
 ```powershell
-cd C:\qrtunnel\a_end
+cd C:\qr-git-tunnel\a_end
 pip install -r requirements.txt
 ```
 
@@ -286,7 +286,7 @@ pip install -r requirements.txt
 **2.4 启动 A 端代理：**
 
 ```powershell
-cd C:\qrtunnel
+cd C:\qr-git-tunnel
 start_a.bat
 ```
 
@@ -367,8 +367,8 @@ http://jiaxiaoxia2:****@127.0.0.1:9999/fsdp/cmus-service.git
 **1.1 在 Win 虚拟机里下载离线包：**
 
 ```powershell
-mkdir C:\qrtunnel-offline
-cd C:\qrtunnel-offline
+mkdir C:\qr-git-tunnel-offline
+cd C:\qr-git-tunnel-offline
 
 # 下载 Python 3.11 x86-64 安装包（注意不是 ARM64 版）
 # 浏览器打开 https://www.python.org/downloads/windows/
