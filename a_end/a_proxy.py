@@ -587,7 +587,7 @@ def _score_candidate(cand):
     # Process identity (account-independent).
     if "hsrclient" in pl:
         score += 80
-    elif "cmss" in pl or "receiver" in pl or "wsg" in pl:
+    elif "receiver" in pl or "wsg" in pl:
         score += 60
     # Generic title pattern "user-<number>" (e.g. wangchu2-1, zhangsan-2).
     trimmed = title.strip()
@@ -601,7 +601,7 @@ def _score_candidate(cand):
     elif "hwndwrapper" in cl:
         score += 20
     # Branding hints (Chinese client strings).
-    if "中移" in tl or "云桌面" in tl or "桌面" in tl:
+    if "云桌面" in tl or "桌面" in tl:
         score += 15
     # Larger area usually means the live desktop surface.
     score += min(w * h / 2000000.0, 1.0) * 20
@@ -638,7 +638,7 @@ def find_target_window(keywords=None, diagnose=False, verbose=True):
     kw_results = []
     all_candidates = []
     fallback_keywords = keywords or [
-        "中移在线", "云桌面", "Remote Desktop", "mstsc", "rdp", "CmDesktop",
+        "云桌面", "Remote Desktop", "mstsc", "rdp", "CmDesktop",
         "WSG", "HSR", "hsr", "remote", "desktop", "桌面",
     ]
 

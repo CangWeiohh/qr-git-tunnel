@@ -197,10 +197,13 @@ qr-git-tunnel/
 ├── start_b.bat                # 根目录 B 端启动脚本
 ├── a_end/                     # A 端（跑在能看见云桌面窗口的机器上）
 │   ├── a_proxy.py             # HTTP 代理 + 截屏 + 解码
+│   ├── python-3.11.9-embed-arm64.zip  # A 端离线 Python（ARM64 可嵌入版，可选）
 │   └── requirements.txt       # 依赖列表
 ├── b_end/                     # B 端（跑在云桌面内，离线）
 │   ├── b_tunnel.py            # 剪贴板监听 + 转发 + 二维码生成
-│   └── requirements.txt       # 依赖列表
+│   ├── python-3.11.9-amd64.exe      # B 端离线 Python 安装包（x86-64）
+│   └── whl/                   # B 端离线依赖 wheel（qrcode/pillow/pywin32/zxing-cpp）
+│       └── requirements.txt   # 依赖列表
 └── text2qr.html               # 独立二维码测试工具（可选）
 ```
 
@@ -217,7 +220,7 @@ qr-git-tunnel/
 | IDEA 填什么 | `http://127.0.0.1:9999/...` | `http://<虚拟机IP>:9999/...` |
 | A 端监听 | `127.0.0.1:9999` | **必须** `0.0.0.0:9999` |
 | Python | 官网 x64 安装包 | ARM64 embeddable 或 x64 安装包 |
-| B 端离线包从哪下 | 本机直接下（同是 x64） | 虚拟机里 `pip download --platform win_amd64` |
+| B 端离线件 | 部署包已内置（`b_end/python-3.11.9-amd64.exe` + `b_end/whl/`） | 部署包已内置（同左，x86-64） |
 
 ---
 
@@ -227,28 +230,22 @@ qr-git-tunnel/
 
 ### 第 1 步：在云桌面部署 B 端（一次性）
 
-云桌面完全离线，需要把 Python 和依赖包拷进去。
+云桌面完全离线，需要把 Python 和依赖包拷进去。**离线安装件已随仓库/部署包内置**（`b_end/python-3.11.9-amd64.exe` 和 `b_end/whl/`），无需再联网下载。
 
-**1.1 在本机（Windows 物理机）下载离线包：**
+**1.1 确认离线安装件已就位：**
 
-```powershell
-mkdir C:\qr-git-tunnel-offline
-cd C:\qr-git-tunnel-offline
+部署包（zip 或 GitHub 下载的仓库）中已包含：
 
-# 下载 Python 3.11+ x64 安装包
-# 浏览器打开 https://www.python.org/downloads/windows/
-# 下载 "Windows installer (64-bit)"，放到 C:\qr-git-tunnel-offline\
+- `b_end/python-3.11.9-amd64.exe` —— Python 3.11.9 x86-64 安装包
+- `b_end/whl/` —— 全部依赖 wheel（`qrcode`、`pillow`、`pywin32`、`zxing-cpp`）+ `requirements.txt`
 
-# 下载依赖包（本机是 x64，直接 pip download）
-pip download qrcode pillow pywin32 -d .
-```
+> 不需要再执行 `pip download` 或手动下载 Python 安装包。若坚持自己下载，可在本机（同是 x64）执行 `pip download qrcode pillow pywin32 -d .`，并把 Python 安装包一并放好。
 
-**1.2 把离线包和 B 端代码拷进云桌面：**
+**1.2 把 B 端文件拷进云桌面：**
 
 把以下内容从本机拷进云桌面（比如拷到桌面同一个目录）:
-- `C:\qr-git-tunnel-offline\` 整个文件夹（含 Python 安装包和 pip 依赖包）
 - 根目录 `config.yaml`、`start_b.bat`
-- `b_end/` 文件夹（含 `b_tunnel.py`、`requirements.txt`）
+- `b_end/` 整个文件夹（含 `b_tunnel.py`、`python-3.11.9-amd64.exe`、`whl/`）
 
 启动目录应保持为：
 
@@ -256,21 +253,24 @@ pip download qrcode pillow pywin32 -d .
 <部署目录>\
 ├── config.yaml
 ├── start_b.bat
-└── b_end\b_tunnel.py
+└── b_end\
+    ├── b_tunnel.py
+    ├── python-3.11.9-amd64.exe
+    └── whl\
 ```
 
 **1.3 在云桌面安装 Python：**
 
-双击 Python 安装包，**勾选 "Add Python to PATH"**，然后点 Install。
+双击 `b_end\python-3.11.9-amd64.exe`，**勾选 "Add Python to PATH"**，然后点 Install。
 
 **1.4 在云桌面安装依赖（离线安装，不联网）：**
 
 ```powershell
-cd C:\Users\<你的用户名>\Desktop\qr-git-tunnel-offline
-pip install --no-index --find-links=. qrcode pillow pywin32
+cd <部署目录>\b_end\whl
+pip install --no-index --find-links=. qrcode pillow pywin32 zxing-cpp
 ```
 
-> `--no-index --find-links=.` 表示只从当前目录安装，不访问网络。
+> `--no-index --find-links=.` 表示只从当前目录（`b_end/whl`）安装，不访问网络。
 
 **1.5 启动 B 端：**
 
@@ -381,34 +381,30 @@ http://jiaxiaoxia2:****@127.0.0.1:9999/fsdp/cmus-service.git
 
 ### 第 1 步：在云桌面部署 B 端（一次性）
 
-云桌面是 x86_64 架构，完全离线。需要在虚拟机里下载离线包后拷进去。
+云桌面是 x86_64 架构，完全离线。**离线安装件已随仓库/部署包内置**，无需在虚拟机里再 `pip download --platform win_amd64`。
 
-**1.1 在 Win 虚拟机里下载离线包：**
+**1.1 确认离线安装件已就位：**
 
-```powershell
-mkdir C:\qr-git-tunnel-offline
-cd C:\qr-git-tunnel-offline
+部署包（zip 或 GitHub 下载的仓库）中已包含：
 
-# 下载 Python 3.11 x86-64 安装包（注意不是 ARM64 版）
-# 浏览器打开 https://www.python.org/downloads/windows/
-# 下载 "Windows installer (64-bit)"
+- `b_end/python-3.11.9-amd64.exe` —— Python 3.11.9 x86-64 安装包（注意不是 ARM64 版）
+- `b_end/whl/` —— 全部依赖 wheel（`qrcode`、`pillow`、`pywin32`、`zxing-cpp`）+ `requirements.txt`
 
-# 下载依赖包（必须指定 win_amd64 平台，否则会下成 ARM64 包）
-C:\Python311\Scripts\pip.exe download --platform win_amd64 --only-binary=:all: qrcode pillow pywin32 zxing-cpp -d .
-```
+> 不需要再执行 `pip download`。若坚持自己下载，可在虚拟机里执行 `C:\Python311\Scripts\pip.exe download --platform win_amd64 --only-binary=:all: qrcode pillow pywin32 zxing-cpp -d .`（必须指定 win_amd64 平台，否则会下成 ARM64 包）。
 
 **1.2 拷进云桌面：**
 
 - 本仓库根目录的 `config.yaml`、`start_b.bat`
-- `b_end/` 文件夹（保持 `b_end\\b_tunnel.py` 的相对路径）
+- `b_end/` 整个文件夹（保持 `b_end\\b_tunnel.py` 的相对路径，含 `python-3.11.9-amd64.exe`、`whl/`）
+
 **1.3 在云桌面安装 Python：**
 
-双击 Python 安装包，**勾选 "Add Python to PATH"**。
+双击 `b_end\python-3.11.9-amd64.exe`，**勾选 "Add Python to PATH"**。
 
 **1.4 离线安装依赖：**
 
 ```powershell
-cd <离线包在云桌面的路径>
+cd <部署目录>\b_end\whl
 pip install --no-index --find-links=. qrcode pillow pywin32 zxing-cpp
 ```
 
@@ -652,7 +648,7 @@ python a_proxy.py --listen 0.0.0.0:9999
 | 现象 | 处理 |
 |------|------|
 | fetch/clone 时听到与翻码同频的"嗒嗒"声 | HSRClient 的剪贴板粘贴/同步提示音（A 端每 500ms 写一次 MISSING）；关闭该音效即可，非隧道故障 |
-| clone 一屏停几秒才换屏 | B 端没装 zxing-cpp，QR 编码回退到纯 Python qrcode；离线安装 `pip install --no-index --find-links=. zxing-cpp` |
+| clone 一屏停几秒才换屏 | B 端没装 zxing-cpp，QR 编码回退到纯 Python qrcode；离线安装 `cd <部署目录>\b_end\whl && pip install --no-index --find-links=. zxing-cpp` |
 | Mac 连不上 9999（拓扑 B） | A 端改 `--listen 0.0.0.0:9999`；删旧 `netsh portproxy`；确认虚拟机 IP |
 | 本机 IDEA 连不上（拓扑 A） | 确认 A 端已启动；URL 用 `127.0.0.1` 而不是局域网 IP |
 | B 端收不到请求 | 确认 HSRClient 未最小化；看 A 端是否打印 `[focus] brought RDP...` |
