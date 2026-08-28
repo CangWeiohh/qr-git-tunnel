@@ -1,0 +1,4 @@
+mss>=9.0
+pillow>=9.0
+zxing-cpp>=2.2
+numpy>=1.21

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+
+# Runtime logs & summaries (script-sibling logs/)
+logs/
+
+# Local AI-agent tooling (absolute paths, machine-specific)
+.claude/
+
+# Large offline deployment artifacts: kept out of git, shipped in the
+# Downloads deploy package (python installers + platform wheels).
+a_end/python-*.zip
+b_end/python-*.exe
+b_end/whl/

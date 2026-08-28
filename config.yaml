@@ -1,0 +1,47 @@
+# QR Tunnel 启动配置
+# 本文件被根目录 start_a.bat / start_b.bat 与 a_end/a_proxy.py、b_end/b_tunnel.py 读取。
+# 参数优先级：命令行 CLI > config.yaml > 程序内置默认值。
+
+# ---------------- Python 解释器 ----------------
+# A/B 端各自指定解释器绝对路径；留空 "" 则使用 PATH 中的 python。
+# 仅 start_a.bat / start_b.bat 使用（决定用哪个解释器启动）。
+a_python: "C:\Python311\python.exe"
+b_python: ""
+
+# ---------------- A 端（Windows ARM VM） ----------------
+# Mac/IDEA 需要访问 A 端时监听 0.0.0.0；仅本机使用可改为 127.0.0.1:9999。
+a_listen: 0.0.0.0:9999
+# 截屏显示器：-1=自动，0=主屏，1=副屏。
+a_display_index: -1
+# 普通 QR 每页分块字节数；必须与 B 端 b_chunk 一致。
+a_chunk: 2800
+# HSRClient 窗口标题关键字（逗号分隔）；留空则自动发现。
+a_window_keywords: ""
+# 是否跳过启动能力探针。
+a_no_probe: false
+
+# ---------------- B 端（离线云桌面） ----------------
+# 内网 Git 服务地址。
+b_target: 192.168.21.14:8888
+# 每帧显示时间（毫秒）；300 为当前稳定档。
+b_page_ms: 300
+# 普通 QR 每页分块字节数；必须与 A 端 a_chunk 一致。
+b_chunk: 2800
+# QR 播放轮数；后续轮只重播缺失页。
+b_loops: 5
+# 收到请求后显示 ACK QR 的时间（毫秒）。
+b_ack_ms: 800
+# 单次响应允许的最大 QR 数据页数。
+b_max_pages: 20000
+# 每帧最多二维码数量；0=自动。
+b_max_qr: 8
+# 多 QR 模式每个模块的最小像素数。
+b_min_box_size: 2
+# 显示方式：tkinter / html。
+b_display: tkinter
+# 是否禁用 Bulk 高吞吐路径。
+b_disable_bulk: false
+# 压缩后普通页数超过该阈值时启用 Bulk。
+b_bulk_threshold: 400
+# Bulk 每页分块字节数；必须 >= b_chunk 且 <= 2916。
+b_bulk_chunk: 2900
