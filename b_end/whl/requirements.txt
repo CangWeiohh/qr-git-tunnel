@@ -1,0 +1,4 @@
+qrcode>=7.4
+pillow>=9.0
+pywin32>=227; platform_system=="Windows"
+zxing-cpp>=2.2
