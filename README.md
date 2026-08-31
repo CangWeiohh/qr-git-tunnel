@@ -209,6 +209,43 @@ qr-git-tunnel/
 └── text2qr.html               # 独立二维码测试工具（可选）
 ```
 
+### 轻量部署包生成规则（固定）
+
+Downloads 中的轻量部署包必须严格对应生成时仓库的最新提交，不能沿用旧提交的包名或目录名。每次生成时按以下规则执行：
+
+1. 进入唯一开发仓库，读取当前提交的 7 位短哈希：
+
+   ```bash
+   cd /Users/cangwei/Personal.localized/develop/github/qr-git-tunnel
+   commit=$(git rev-parse --short=7 HEAD)
+   ```
+
+2. ZIP 文件名必须是 `qr-git-tunnel-<commit>.zip`，例如 `qr-git-tunnel-703c87d.zip`。
+3. ZIP 解压后的唯一顶层目录必须是 `qr-git-tunnel-<commit>/`，例如 `qr-git-tunnel-703c87d/`；ZIP 内容必须来自同一个 `HEAD`，文件名、目录名和提交哈希不能混用。
+4. 轻量包必须排除已安装的运行环境文件：
+   - `a_end/python-3.11.9-embed-arm64.zip`
+   - `b_end/python-3.11.9-amd64.exe`
+   - `b_end/whl/`
+   - `.mnemon/`、`__pycache__/`、`.DS_Store`、`logs/`
+5. 轻量包必须保留运行所需的代码、配置、启动脚本、`requirements.txt`、README、AGENTS、VERSION 和测试文件。目标机器必须预先安装 Python 及 `requirements.txt` 中的依赖。
+6. 生成后必须执行 ZIP 完整性检查，并确认只有一个顶层目录且上述排除项不存在。
+
+推荐使用 Git 归档生成，保证包内容与提交一致：
+
+```bash
+cd /Users/cangwei/Personal.localized/develop/github/qr-git-tunnel
+commit=$(git rev-parse --short=7 HEAD)
+git archive --format=zip \
+  --prefix="qr-git-tunnel-${commit}/" \
+  -o "/Users/cangwei/Downloads/qr-git-tunnel-${commit}.zip" HEAD -- . \
+  ':(exclude)a_end/python-3.11.9-embed-arm64.zip' \
+  ':(exclude)b_end/python-3.11.9-amd64.exe' \
+  ':(exclude)b_end/whl' \
+  ':(exclude).mnemon'
+```
+
+> GitHub 完整仓库仍保留离线 Python 安装包和 `b_end/whl/`；上面的规则只适用于 Downloads 轻量部署包。
+
 ---
 
 ## 部署：先选你的拓扑
