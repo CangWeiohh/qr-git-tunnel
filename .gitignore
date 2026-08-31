@@ -13,3 +13,6 @@ logs/
 
 # Local AI-agent tooling (absolute paths, machine-specific)
 .claude/
+
+# DSH / Mnemon workspace memory
+.mnemon/
