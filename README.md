@@ -28,14 +28,9 @@
 
 对应 GitHub 仓库为 [CangWeiohh/qr-git-tunnel](https://github.com/CangWeiohh/qr-git-tunnel)，默认分支为 `main`。
 
-旧目录 `/Users/cangwei/Personal.localized/develop/python/qrtunnel` 仅作为历史本地副本和备份保留：
+旧目录 `/Users/cangwei/Personal.localized/develop/python/qrtunnel` 已删除，不再作为工作目录、历史副本或备份使用。所有新改动、测试、提交和部署包都必须从本仓库产生。
 
-- 不再在旧目录中开发、修改或提交代码
-- 不再从旧目录生成新的对外交付版本
-- 如需查阅历史实现，只读对照即可
-- 所有新改动、测试、提交和部署包都必须从本仓库产生
-
-如果 AI 工具收到二维码传输方案的开发任务，应直接进入本仓库，不要继续使用旧的 `/develop/python/qrtunnel` 目录。
+如果 AI 工具收到二维码传输方案的开发任务，应直接进入本仓库；旧目录已删除，不再存在可供使用的旧工作副本。
 
 ---
 

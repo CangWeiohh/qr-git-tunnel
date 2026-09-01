@@ -15,9 +15,7 @@ Git / IDEA ──HTTP──> A proxy ──剪贴板 QRT:b64:──> B tunnel �
 
 - **今后二维码传输方案的唯一开发、测试、提交和发布仓库**：`/Users/cangwei/Personal.localized/develop/github/qr-git-tunnel`
 - GitHub 远程：`https://github.com/CangWeiohh/qr-git-tunnel.git`，默认分支为 `main`
-- 旧目录 `/Users/cangwei/Personal.localized/develop/python/qrtunnel` 仅作为历史本地副本和备份保留：**不再在其中开发、修改、提交或生成新的交付版本**
-- 如果收到涉及二维码传输方案的开发任务，默认进入本仓库；如需参考旧目录，只读对照即可，完成后应把改动落在本仓库
-- 新版本应从本仓库提交、测试并生成部署包；不要把旧目录当作源目录，也不要把旧目录中的 `backup/` 当作当前开发输出目录
+- 新版本应从本仓库提交、测试并生成部署包；旧目录已删除，不存在可供参考的旧工作副本
 
 ## 最重要的约束（改代码前必须懂）
 
