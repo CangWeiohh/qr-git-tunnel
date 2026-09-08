@@ -427,6 +427,52 @@ def compose_qr_frame(images, cols, rows, qr_w, qr_h):
     return canvas
 
 
+def create_root_window(label, retries=2, settle=0.05):
+    """Create a Tk root window that is actually mapped to the screen.
+
+    History: QR pages were occasionally "played" (logs, render stats) while the
+    fullscreen Tk window never appeared on the cloud desktop screen — A-end then
+    decoded nothing and timed out after 120s. tkinter silently tolerates an
+    unmapped window: every call succeeds, but the window never becomes visible
+    (observed right after another Tk() root was created and destroyed in quick
+    succession, e.g. show_ack -> show_pages). We therefore verify the window is
+    mapped and viewable before returning it, and rebuild it (``retries`` times)
+    when the first attempt fails.
+
+    Returns (root, True) when a mapped window is ready, or (None, False) after
+    giving up. The caller must destroy a non-None root.
+    """
+    for attempt in range(retries + 1):
+        root = None
+        try:
+            root = tk.Tk()
+            if settle:
+                time.sleep(settle)  # let the window manager map the window
+            for _ in range(15):
+                root.update_idletasks()
+                if root.winfo_ismapped() and root.winfo_viewable():
+                    return root, True
+                time.sleep(0.02)
+            mapped = bool(root.winfo_ismapped() and root.winfo_viewable())
+            raise RuntimeError(
+                f"window not mapped to screen (ismapped="
+                f"{root.winfo_ismapped()}, viewable={root.winfo_viewable()})")
+        except Exception as exc:
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+                root = None
+            if attempt < retries:
+                time.sleep(0.3)  # let the Tcl interpreter fully release
+                continue
+            blog_event("ERROR", "DISPLAY",
+                       f"{label}: window create failed after {retries + 1} attempts: {exc}")
+            return None, False
+    return None, False
+
+
 def show_ack(req_id, hold_ms=800):
     """Show a small centered topmost ACK QR for hold_ms.
 
@@ -434,7 +480,10 @@ def show_ack(req_id, hold_ms=800):
     A-end keeps re-writing the request to the clipboard until it sees this
     ACK QR (or a response page) for the same req_id.
     """
-    root = tk.Tk()
+    root, ok = create_root_window("ACK")
+    if not ok:
+        blog_event("ERROR", "ACK", f"ACK window failed; A-end will retry the request", req_id)
+        return
     root.attributes("-topmost", True)
     root.overrideredirect(True)   # borderless, consistent with the main QR window
     root.configure(background="black")
@@ -460,7 +509,10 @@ def show_stopped(req_id, hold_ms=500):
     A-end uses this screen ACK to release the serialized HTTP request immediately
     instead of always sleeping two seconds before the next Git request.
     """
-    root = tk.Tk()
+    root, ok = create_root_window("STOPPED")
+    if not ok:
+        blog_event("WARN", "STOPPED", f"STOPPED window failed; A-end falls back to 2.2s wait", req_id)
+        return
     root.attributes("-topmost", True)
     root.overrideredirect(True)
     root.configure(background="black")
@@ -658,7 +710,11 @@ class QRDisplay:
             nonlocal stop_manual
             stop_manual = True
 
-        root = tk.Tk()
+        root, mapped_ok = create_root_window("QR display")
+        if not mapped_ok:
+            blog_event("ERROR", "DISPLAY",
+                       f"QR window could not be mapped; giving up on response {req_id}", req_id)
+            return "display_failed"
         root.attributes("-topmost", True)
         root.overrideredirect(True)
         root.configure(background="black")
@@ -671,7 +727,9 @@ class QRDisplay:
         # Normal full-screen capacity (used to split a long response into frames).
         normal_cols, normal_rows, normal_box = self._calc_grid(sw, sh)
         normal_capacity = normal_cols * normal_rows
-        blog_event("INFO", "DISPLAY", f"screen={sw}x{sh}, grid={normal_cols}x{normal_rows}={normal_capacity}, box={normal_box}, pages={len(payloads)}, loops={self.loops}", req_id)
+        blog_event("INFO", "DISPLAY",
+                   f"screen={sw}x{sh}, grid={normal_cols}x{normal_rows}={normal_capacity}, "
+                   f"box={normal_box}, pages={len(payloads)}, loops={self.loops}, mapped=YES", req_id)
 
         # One centered label shows the whole composed frame. Every frame is a
         # single PIL canvas with all cell QRs pasted in, so a frame needs exactly
@@ -1561,6 +1619,11 @@ class BTunnel:
             show_ack(req_id, self.ack_ms)
         except Exception as e:
             self.log_req("ERROR", "ACK", f"display failed: {e}", req_id)
+        # Brief settle before the next Tk() root (show_pages): quick destroy ->
+        # create cycles of separate Tcl interpreters were observed to leave the
+        # new window unmapped on some cloud desktops (fixed by create_root_window
+        # verification, but the pause costs ~100ms and reduces the trigger).
+        time.sleep(0.1)
 
         # Wait in short intervals so CANCEL can abort a slow intranet request.
         # Local-response requests (capability probe, 426 compatibility error)
@@ -1674,6 +1737,19 @@ class BTunnel:
                 self.processed[req_id] = time.time()
                 self.cleanup()
                 _write_summary({"status": "cancelled", "request_id": req_id, "terminal_reason": terminal_reason})
+                return
+            if terminal_reason == "display_failed":
+                # The QR window could not be mapped after retries (see
+                # create_root_window). Nothing was shown, so wait for the client
+                # to time out / cancel, but record the failure loudly and mark
+                # this transfer as failed in the history.
+                self.log_req("ERROR", "DISPLAY",
+                             f"QR window unmapped; response {len(pages)} pages never shown", req_id)
+                self.observe_completed_clipboard(req_id)
+                self.processed[req_id] = time.time()
+                self.cleanup()
+                _write_summary({"status": "display_failed",
+                                "request_id": req_id, "terminal_reason": terminal_reason})
                 return
 
         # Read-only handoff: inspect whether A-end already placed the next
