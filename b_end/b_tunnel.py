@@ -533,6 +533,48 @@ def show_stopped(req_id, hold_ms=500):
 
 # ---- QR display ----
 
+# ---- rewrite-triggered replay -------------------------------------------
+# The A->B clipboard channel and the B->A screen channel are independent RDP
+# virtual channels and fail independently. When the clipboard stays alive but
+# the QR display was never decoded, A-end sees no ACK and rewrites the SAME
+# req_id with a higher "retry" counter. Treating that rewrite as a stale
+# duplicate (the old behaviour) turns a short screen glitch into a guaranteed
+# ~30s ACK timeout and an HTTP 502 for the git client: B-end had already
+# stopped playing after "no MISSING" and ignored every rewrite. B-end now keeps
+# the last encoded response briefly and replays ACK + pages when it sees a
+# newer retry of that same request.
+REPLAY_WINDOW_S = 120.0
+
+
+def _is_replay_rewrite(entry, req, now=None, window=REPLAY_WINDOW_S):
+    """Decide whether a parsed request is a fresh retry of the cached response.
+
+    ``entry`` is the last cached ``{"req_id", "pages", "ts", "retry"}`` dict.
+    True only for the same request id, inside the replay window, and with a
+    strictly higher A-side retry counter than the last one handled — so an RDP
+    echo of an older clipboard value can never trigger a replay.
+    """
+    if not entry or not req or not entry.get("pages"):
+        return False
+    req_id = req.get("id")
+    if not req_id or entry.get("req_id") != req_id:
+        return False
+    if now is None:
+        now = time.time()
+    try:
+        age = now - float(entry.get("ts") or 0)
+    except (TypeError, ValueError):
+        return False
+    if age > float(window):
+        return False
+    try:
+        incoming = int(req.get("retry") or 1)
+        handled = int(entry.get("retry") or 0)
+    except (TypeError, ValueError):
+        return False
+    return incoming > handled
+
+
 class QRDisplay:
     """Fullscreen QR display using tkinter.
 
@@ -1324,6 +1366,10 @@ class BTunnel:
         self.display = QRDisplay(page_ms=page_ms, loops=loops,
                                  max_qr=max_qr, min_box_size=min_box_size)
         self.processed = {}  # req_id -> timestamp
+        # Last encoded response, kept briefly so a request rewrite (A-end never
+        # saw the ACK) can be answered by replaying instead of being ignored.
+        # Shape: {"req_id", "pages", "ts", "retry"} — see _is_replay_rewrite.
+        self._replay = None
 
     def log(self, msg):
         blog_event("INFO", "MAIN", msg)
@@ -1332,7 +1378,12 @@ class BTunnel:
         blog_event(level, phase, message, req_id)
 
     def wait_clipboard(self, poll_ms=200):
-        """Wait until a valid, unprocessed QRT:b64 request is present.
+        """Wait until a valid QRT:b64 request is present.
+
+        Returns ``(kind, text)`` where kind is ``"new"`` for a request that has
+        not been processed yet, or ``"replay"`` when A-end is rewriting an
+        already-processed request because it never saw the ACK QR (B->A screen
+        glitch while the A->B clipboard stayed alive) — see _is_replay_rewrite.
 
         B-end is strictly READ-ONLY on the clipboard. Control states
         (DONE/CANCEL/MISSING/IDLE), stale requests and unrelated user clipboard
@@ -1347,21 +1398,37 @@ class BTunnel:
             blog_event("WARN", "CLIP", f"startup read retry: {exc}")
             last = ""
 
-        def new_request(text):
+        def classify(text):
+            """Return (kind, text) for a fresh request or a rewrite to replay."""
             if not text.startswith("QRT:b64:"):
                 return None
             req = self.parse_request(text)
             if not req:
                 return None
             req_id = req.get("id")
-            if not req_id or req_id in self.processed:
+            if not req_id:
                 return None
-            return text
+            if req_id not in self.processed:
+                return ("new", text)
+            # Same request id as one we already finished: accept it only when
+            # A-end bumped its retry counter, i.e. it is still waiting for an
+            # ACK/pages that never reached the screen.
+            if _is_replay_rewrite(self._replay, req):
+                try:
+                    self._replay["retry"] = int(req.get("retry") or 1)
+                except (TypeError, ValueError):
+                    pass
+                self._replay["ts"] = time.time()
+                return ("replay", text)
+            return None
 
-        present = new_request(last)
+        present = classify(last)
         if present:
+            kind, body = present
             blog_event("INFO", "CLIP",
-                       f"request already present when waiting started; bytes={len(present)}")
+                       f"request already present when waiting started; "
+                       f"bytes={len(body)}"
+                       + (" (replay of processed request)" if kind == "replay" else ""))
             return present
 
         poll_count = 0
@@ -1375,10 +1442,15 @@ class BTunnel:
                     blog_event("WARN", "CLIP", f"read retry: {exc}")
                 continue
 
-            present = new_request(cur)
+            present = classify(cur)
             if present:
-                blog_event("INFO", "CLIP",
-                           f"new request on clipboard: bytes={len(present)}")
+                kind, body = present
+                if kind == "replay":
+                    blog_event("INFO", "CLIP",
+                               f"rewrite of processed request for replay: bytes={len(body)}")
+                else:
+                    blog_event("INFO", "CLIP",
+                               f"new request on clipboard: bytes={len(body)}")
                 return present
 
             # Everything other than a fresh QRT:b64 request is an idle/control
@@ -1500,16 +1572,20 @@ class BTunnel:
 
         while True:
             try:
-                text = self.wait_clipboard()
-                self._process_request(text)
+                text, kind = self.wait_clipboard()
+                self._process_request(text, replay=(kind == "replay"))
             except Exception as exc:
                 import traceback
                 blog_event("ERROR", "MAIN", f"unexpected error: {exc!r}; continuing", None)
                 traceback.print_exc()
                 time.sleep(0.5)
 
-    def _process_request(self, text):
+    def _process_request(self, text, replay=False):
         """Handle one clipboard request (a QRT text) and keep the tunnel alive.
+
+        ``replay=True`` handles a rewrite of an already-finished request: A-end
+        never decoded the ACK/pages (B->A screen glitch) and is retrying, so
+        the cached response is re-shown instead of the rewrite being ignored.
 
         Any error raised inside is caught by run() so a single bad request can
         never kill B-end (previously an uncaught exception in show_pages would
@@ -1542,10 +1618,50 @@ class BTunnel:
             return
 
         req_id = req.get("id", "")
+        is_probe = is_probe_request(req)
+        try:
+            retry = int(req.get("retry") or 1)
+        except (TypeError, ValueError):
+            retry = 1
+
+        if replay:
+            # A-end rewrote a request we already finished: it never decoded the
+            # ACK or the response pages (the B->A screen channel glitched while
+            # the A->B clipboard stayed alive). Re-show the ACK and replay the
+            # cached response instead of treating the rewrite as a stale
+            # duplicate, which would guarantee an ACK timeout and HTTP 502.
+            entry = self._replay
+            if not entry or entry.get("req_id") != req_id or not entry.get("pages"):
+                self.log(f"Replay requested for {req_id[:8]}... but no cached response; ignoring")
+                return
+            entry["retry"] = max(int(entry.get("retry") or 0), retry)
+            entry["ts"] = time.time()
+            pages = entry["pages"]
+            self.log_req("INFO", "REQ",
+                         f"{req.get('method', 'GET')} {req.get('path', '/')} "
+                         f"(A attempt {retry}) — rewrite of a finished request; "
+                         f"replaying cached response ({len(pages)} pages)", req_id)
+            _write_summary({
+                "status": "in_progress",
+                "request_id": req_id,
+                "method": req.get("method", "GET"),
+                "path": req.get("path", "/"),
+                "replay": True,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            })
+            # ACK first: A-end only starts collecting pages after it decodes one.
+            self.log_req("INFO", "ACK", "re-showing ACK; replaying cached response", req_id)
+            try:
+                show_ack(req_id, self.ack_ms)
+            except Exception as e:
+                self.log_req("ERROR", "ACK", f"display failed: {e}", req_id)
+            time.sleep(0.1)
+            self._play_and_finalize(req_id, pages, is_probe)
+            return
+
         if req_id in self.processed:
             self.log(f"Skip duplicate {req_id[:8]}...")
             return
-        is_probe = is_probe_request(req)
         request_protocol = req.get("protocol")
         request_version = req.get("client_version")
         compatibility_error = None
@@ -1562,7 +1678,6 @@ class BTunnel:
         path = req.get("path", "/")
         headers = req.get("headers", [])
         body_b64 = req.get("body")
-        retry = req.get("retry", 1)
         self.log_req("INFO", "REQ", f"{method} {path} (A attempt {retry})", req_id)
         _write_summary({
             "status": "in_progress",
@@ -1704,6 +1819,12 @@ class BTunnel:
         pages = encode_response(status, resp_headers, resp_body, req_id,
                                 eff_chunk, bulk=use_bulk)
         self.log_req("INFO", "ENCODE", f"prepared {len(pages)} QR pages", req_id)
+        # Keep the encoded response briefly: if A-end never decodes the ACK or
+        # the pages it rewrites the same request, and wait_clipboard() turns that
+        # rewrite into a replay of exactly these pages (no re-forward to the
+        # intranet git server, so a replayed push cannot run twice).
+        self._replay = {"req_id": req_id, "pages": pages,
+                        "ts": time.time(), "retry": retry}
         summary_update = {
             "status": "displaying",
             "request_id": req_id,
@@ -1716,6 +1837,15 @@ class BTunnel:
             summary_update["bulk_chunk"] = eff_chunk
         _write_summary(summary_update)
 
+        self._play_and_finalize(req_id, pages, is_probe)
+
+    def _play_and_finalize(self, req_id, pages, is_probe):
+        """Play an encoded response and record its terminal state/history.
+
+        Shared by the normal path and by rewrite-triggered replays so both honour
+        the same stop semantics (DONE / CANCEL / Esc / newer request) and write
+        the same summary and transfer-history entries.
+        """
         terminal_reason = "exhausted"
         if self.display_mode == "html":
             show_qr_html(pages, self.page_ms)

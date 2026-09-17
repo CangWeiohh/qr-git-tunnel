@@ -32,6 +32,17 @@ def exec_function(source, name, namespace):
     return namespace[name]
 
 
+def extract_constant(source, name):
+    """Read one module-level literal constant (single source of truth)."""
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return ast.literal_eval(node.value)
+    raise AssertionError(f"constant {name} not found")
+
+
 def test_config_loading():
     import tempfile
 
@@ -539,6 +550,7 @@ def test_probe_and_426_local_response_no_crash():
     import time as _time
 
     code = extract_function(B_SRC, "_process_request")
+    tail = extract_function(B_SRC, "_play_and_finalize")
     summaries = []
 
     class FakeDisplay:
@@ -606,6 +618,8 @@ def test_probe_and_426_local_response_no_crash():
 
     # --- Probe path ---
     fake = FakeSelf(is_probe=True)
+    exec(compile(tail, "<_play_and_finalize>", "exec"), ns)
+    FakeSelf._play_and_finalize = ns["_play_and_finalize"]
     exec(compile(code, "<_process_request>", "exec"), ns)
     ns["_process_request"](fake, "QRT:b64:probe")
     req_id = "c0e2bef4-1111-2222-3333-444444444444"
@@ -620,6 +634,124 @@ def test_probe_and_426_local_response_no_crash():
     assert req_id2 in fake2.processed, "426 req_id must be marked processed"
     assert any(s.get("status") == "completed" for s in summaries), summaries
     print("test_probe_and_426_local_response_no_crash OK")
+
+
+def test_replay_rewrite_detection():
+    """B-end must treat a same-id rewrite with a higher A-side retry counter as a
+    request to replay (A never decoded the ACK), while ignoring older echoes,
+    foreign request ids, and entries outside the replay window.
+    """
+    window = extract_constant(B_SRC, "REPLAY_WINDOW_S")
+    ns = {"time": _time, "REPLAY_WINDOW_S": window}
+    is_replay = exec_function(B_SRC, "_is_replay_rewrite", ns)
+
+    now = 1000.0
+    entry = {"req_id": "abc", "pages": ["meta", "data"], "ts": now - 5, "retry": 2}
+
+    def req(rid, retry):
+        return {"id": rid, "method": "GET", "path": "/x", "retry": retry}
+
+    assert is_replay(entry, req("abc", 3), now=now) is True
+    assert is_replay(entry, req("abc", 2), now=now) is False   # echo of handled retry
+    assert is_replay(entry, req("abc", 1), now=now) is False   # older echo
+    assert is_replay(entry, req("other", 9), now=now) is False  # different request
+    assert is_replay(entry, {"id": "abc", "retry": "x"}, now=now) is False
+    fresh = {"req_id": "abc", "pages": ["meta"], "ts": now, "retry": 2}
+    assert is_replay(fresh, req("abc", 3), now=now + window + 1) is False  # expired
+    assert is_replay(fresh, req("abc", 3), now=now + window - 1) is True   # inside window
+    assert is_replay(None, req("abc", 3), now=now) is False
+    assert is_replay({"req_id": "abc", "pages": [], "ts": now, "retry": 0},
+                     req("abc", 1), now=now) is False
+    # A request without a retry field counts as attempt 1.
+    assert is_replay({"req_id": "abc", "pages": ["p"], "ts": now, "retry": 0},
+                     {"id": "abc"}, now=now) is True
+    print("test_replay_rewrite_detection OK")
+
+
+def test_replay_path_uses_cached_pages():
+    """_process_request(replay=True) must re-show the ACK and replay the cached
+    pages WITHOUT re-forwarding to the intranet git server (a replayed push must
+    never run twice)."""
+    code = extract_function(B_SRC, "_process_request")
+    tail = extract_function(B_SRC, "_play_and_finalize")
+    summaries = []
+    acks = []
+    played = []
+
+    class FakeDisplay:
+        def show_pages(self, pages, req_id):
+            played.append(list(pages))
+            return "done"
+
+    class FakeSelf:
+        def __init__(self):
+            self.processed = {"rid-1": 1.0}
+            self._replay = {"req_id": "rid-1", "pages": ["meta", "data"],
+                            "ts": _time.time(), "retry": 2}
+            self.chunk_bytes = 2800
+            self.max_pages = 500
+            self.page_ms = 200
+            self.ack_ms = 800
+            self.display_mode = "tkinter"
+            self.display = FakeDisplay()
+            self.target = ("192.168.21.14", 8888)
+            self.disable_bulk = True
+            self.bulk_threshold = 400
+            self.bulk_chunk = 2900
+
+        def log(self, msg):
+            pass
+
+        def log_req(self, level, phase, message, req_id):
+            pass
+
+        def parse_request(self, text):
+            return {"id": "rid-1", "method": "POST",
+                    "path": "/repo/git-receive-pack", "headers": [],
+                    "body": "AAAA", "retry": 3,
+                    "protocol": "qrtunnel-qr-1", "client_version": "0.5.0-dev"}
+
+        def cleanup(self):
+            pass
+
+        def observe_completed_clipboard(self, req_id):
+            return False
+
+        def _is_cancelled(self, req_id):
+            return False
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError("replay must not re-forward or re-encode")
+
+    ns = {
+        "json": json,
+        "time": _time,
+        "threading": __import__("threading"),
+        "PROTOCOL_VERSION": "qrtunnel-qr-1",
+        "VERSION": "0.5.0-dev",
+        "is_probe_request": lambda req: False,
+        "build_probe_response": lambda: (200, [], b""),
+        "show_ack": lambda req_id, hold_ms: acks.append(req_id),
+        "show_stopped": lambda req_id, hold_ms: None,
+        "encode_response": _forbidden,
+        "_compress_plan": lambda body, chunk_bytes: (body, False, 1),
+        "_select_transfer_plan": lambda *a, **k: (False, 2800, 1, 1),
+        "_write_summary": lambda upd: summaries.append(upd),
+        "ForwardControl": lambda: None,
+        "forward_request": _forbidden,
+        "get_screen_size": lambda: (1920, 1080),
+    }
+    exec(compile(tail, "<_play_and_finalize>", "exec"), ns)
+    FakeSelf._play_and_finalize = ns["_play_and_finalize"]
+    exec(compile(code, "<_process_request>", "exec"), ns)
+
+    fake = FakeSelf()
+    ns["_process_request"](fake, "QRT:b64:replay", True)
+    assert acks == ["rid-1"], acks
+    assert played == [["meta", "data"]], played
+    assert any(s.get("replay") is True for s in summaries), summaries
+    assert any(s.get("status") == "completed" for s in summaries), summaries
+    print("test_replay_path_uses_cached_pages OK")
 
 
 def test_compose_frame():
@@ -678,8 +810,12 @@ def main():
     test_window_selection_guards()
     test_deferred_probe_waits_for_window()
     test_bulk_helpers()
-    test_compose_frame()
+    # Keep the PIL-dependent compose test last so a macOS checkout without
+    # Pillow still runs every other test instead of aborting early.
     test_probe_and_426_local_response_no_crash()
+    test_replay_rewrite_detection()
+    test_replay_path_uses_cached_pages()
+    test_compose_frame()
     print("ALL TESTS PASSED")
 
 

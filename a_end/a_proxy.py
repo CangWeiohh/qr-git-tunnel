@@ -138,6 +138,15 @@ if not _FILE_LOGGER.handlers:
 _peer_capability = None  # dict or None
 PROBE_PATH = "/__qrtunnel/probe"
 
+# Consecutive requests that B-end never acknowledged. The A->B clipboard channel
+# (HSRClient RDP clipboard redirection) can silently die while B-end keeps
+# polling and the local clipboard stays healthy: A-end writes fine
+# (local_clip=OK, foreground=YES) but nothing reaches the cloud desktop, and the
+# B->A screen is frozen too. That is an environment condition A-end cannot
+# repair from userland — the HSRClient session must be reconnected — so it is
+# surfaced loudly instead of only as per-request 502s. Reset on any ACK.
+_ack_fail_streak = 0
+
 
 def _write_summary(update):
     global _last_summary, _last_history_key
@@ -1614,6 +1623,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._handle_request()
 
     def _handle_request(self, head_only=False):
+        global _ack_fail_streak
         # Serialize: only one request at a time (clipboard + QR is single-channel)
         with _request_lock:
             req_id, req = self._build_request_json()
@@ -1676,17 +1686,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         break
                     time.sleep(0.1)
                 if acked:
+                    _ack_fail_streak = 0
                     log_event("INFO", "ACK", f"B-end acknowledged on attempt {attempt}", req_id)
                     break
                 log_event("WARN", "ACK", f"no ACK after {ack_wait:.1f}s; rewriting request (attempt {attempt})", req_id)
 
             if not acked:
+                _ack_fail_streak += 1
                 log_event("ERROR", "SEND", f"B-end did not acknowledge after {max_attempts} attempts", req_id)
+                if _ack_fail_streak >= 2:
+                    # local_clip=OK + foreground=YES on every attempt means A-end's
+                    # own clipboard is fine, so the break is in the RDP clipboard
+                    # redirection (or B-end is not running). Either way A-end cannot
+                    # fix it locally; tell the user exactly what to do.
+                    log_event(
+                        "ERROR", "SEND",
+                        f"clipboard channel to B-end looks dead: {_ack_fail_streak} consecutive "
+                        f"requests unacknowledged while local clipboard and HSRClient foreground "
+                        f"were OK — reconnect the HSRClient session (or check B-end is running)",
+                        req_id,
+                    )
                 tracker.mark_done(req_id)
                 try_set_clipboard_text(IDLE_MARKER, "idle marker")
-                _write_summary({"status": "failed", "request_id": req_id, "failure_reason": "clipboard_ack_timeout", "elapsed_seconds": round(time.time() - request_started, 3)})
+                _write_summary({"status": "failed", "request_id": req_id, "failure_reason": "clipboard_ack_timeout", "consecutive_ack_failures": _ack_fail_streak, "elapsed_seconds": round(time.time() - request_started, 3)})
                 self._send_response(502, [], b"QR Tunnel: B-end did not acknowledge request "
-                                             b"(clipboard sync failed after retries)", head_only=head_only)
+                                             b"(clipboard channel down; reconnect the HSRClient "
+                                             b"session and retry)", head_only=head_only)
                 return
 
             # Wait for response via QR screen capture
