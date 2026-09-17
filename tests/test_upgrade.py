@@ -327,7 +327,7 @@ def test_summary_stale_field_reset():
             "version": "0.4.0-dev", "role": "A", "status": "failed",
             "request_id": "old", "http_status": 401, "response_bytes": 26,
             "elapsed_seconds": 125.0, "failure_reason": "response_timeout",
-            "bulk": True, "bulk_chunk": 2900,
+            "bulk": True, "bulk_chunk": 2900, "consecutive_ack_failures": 5,
         },
         "_last_history_key": None,
         "log_event": lambda *a, **k: None,
@@ -338,11 +338,56 @@ def test_summary_stale_field_reset():
     # Simulate a new request starting after a failed one.
     write_summary({"status": "in_progress", "request_id": "new", "method": "GET", "path": "/x"})
     snap = ns["_last_summary"]
-    for stale in ("http_status", "response_bytes", "elapsed_seconds", "failure_reason", "terminal_reason", "qr_pages", "bulk", "bulk_chunk"):
+    for stale in ("http_status", "response_bytes", "elapsed_seconds", "failure_reason", "terminal_reason", "qr_pages", "bulk", "bulk_chunk", "consecutive_ack_failures"):
         assert stale not in snap, f"stale field {stale} leaked into new request"
     assert snap["request_id"] == "new"
     assert snap["status"] == "in_progress"
     print("test_summary_stale_field_reset OK")
+
+
+def test_b_summary_stale_field_reset():
+    """Regression: B-end _write_summary must clear the replay flags when a new
+    request starts.
+
+    They are set while answering a rewrite/MISSING replay and were missing from
+    the reset list, so every later summary kept claiming replay=True: 7 history
+    entries carried the flag on 2026-09-17 evening although only one request was
+    actually replayed.
+    """
+    import tempfile
+    import threading
+    import time as _time
+
+    code = extract_function(B_SRC, "_write_summary")
+    tmpdir = Path(tempfile.mkdtemp())
+    ns = {
+        "json": json,
+        "time": _time,
+        "threading": threading,
+        "VERSION": "0.4.0-dev",
+        "SUMMARY_PATH": tmpdir / "latest.json",
+        "HISTORY_PATH": tmpdir / "history.jsonl",
+        "SUMMARY_LOCK": threading.RLock(),
+        "_last_summary": {
+            "version": "0.4.0-dev", "role": "B", "status": "completed",
+            "request_id": "old", "http_status": 200, "response_bytes": 26,
+            "qr_pages": 2, "terminal_reason": "done",
+            "replay": True, "replay_trigger": "missing", "bulk": True,
+            "bulk_chunk": 2900,
+        },
+        "_last_history_key": None,
+        "blog_event": lambda *a, **k: None,
+    }
+    exec(compile(code, "<_write_summary>", "exec"), ns)
+    write_summary = ns["_write_summary"]
+
+    write_summary({"status": "in_progress", "request_id": "new"})
+    snap = ns["_last_summary"]
+    for stale in ("http_status", "response_bytes", "qr_pages", "terminal_reason",
+                  "replay", "replay_trigger", "bulk", "bulk_chunk"):
+        assert stale not in snap, f"stale field {stale} leaked into new request"
+    assert snap["request_id"] == "new"
+    print("test_b_summary_stale_field_reset OK")
 
 
 def test_probe_detection():
@@ -892,6 +937,152 @@ def test_wait_clipboard_returns_named_item():
     print("test_wait_clipboard_returns_named_item OK")
 
 
+def test_missing_signal_replay_detection():
+    """B-end must read a QRT:MISSING for a finished request as "A-end still
+    waiting" and replay — rate-limited. This is the signal that was ignored as
+    stale while a push hung for 55s (2026-09-17 19:25)."""
+    ns = {"time": _time,
+          "REPLAY_WINDOW_S": extract_constant(B_SRC, "REPLAY_WINDOW_S"),
+          "MISSING_REPLAY_MIN_INTERVAL_S":
+              extract_constant(B_SRC, "MISSING_REPLAY_MIN_INTERVAL_S")}
+    parse_missing = exec_function(B_SRC, "_parse_missing_signal", ns)
+    is_missing = exec_function(B_SRC, "_is_replay_missing", ns)
+
+    assert parse_missing("QRT:MISSING:abc-123:0") == ("abc-123", "0")
+    assert parse_missing("QRT:MISSING:abc-123:1-3,7") == ("abc-123", "1-3,7")
+    assert parse_missing("QRT:MISSING:abc-123:") is None
+    assert parse_missing("QRT:MISSING:abc123") is None
+    assert parse_missing("QRT:b64:zzz") is None
+    assert parse_missing("") is None
+
+    rid = "abc-123"
+    now = 1000.0
+    entry = {"req_id": rid, "pages": ["meta", "data"], "ts": now - 5,
+             "retry": 2, "last_replay_at": 0.0}
+    # Non-empty MISSING for the cached request, never replayed yet -> replay.
+    assert is_missing(entry, rid, now=now) is True
+    # Rate limit: a replay just happened, so a 500ms-later signal must not fire.
+    fresh = {"req_id": rid, "pages": ["p"], "ts": now,
+             "last_replay_at": now - 0.5}
+    assert is_missing(fresh, rid, now=now) is False
+    assert is_missing(fresh, rid, now=now + 2.0) is True
+    # Foreign / expired / empty-cache guards.
+    assert is_missing(entry, "other", now=now) is False
+    assert is_missing(entry, "", now=now) is False
+    assert is_missing(None, rid, now=now) is False
+    assert is_missing({"req_id": rid, "pages": [], "ts": now}, rid, now=now) is False
+    old = {"req_id": rid, "pages": ["p"], "ts": now - 200, "last_replay_at": 0.0}
+    assert is_missing(old, rid, now=now) is False
+    print("test_missing_signal_replay_detection OK")
+
+
+def test_missing_replay_path_uses_cached_pages():
+    """A QRT:MISSING for a finished request must re-show the ACK and replay the
+    cached pages without re-forwarding to the intranet git server."""
+    code = extract_function(B_SRC, "_process_request")
+    tail = extract_function(B_SRC, "_play_and_finalize")
+    parse_missing = exec_function(B_SRC, "_parse_missing_signal", {"time": _time})
+    summaries, acks, played = [], [], []
+
+    class FakeDisplay:
+        def show_pages(self, pages, req_id):
+            played.append(list(pages))
+            return "done"
+
+    class FakeSelf:
+        def __init__(self):
+            self.processed = {"rid-9": 1.0}
+            self._replay = {"req_id": "rid-9", "pages": ["meta", "data"],
+                            "ts": _time.time(), "retry": 1,
+                            "is_probe": False, "last_replay_at": 0.0}
+            self.chunk_bytes = 2800
+            self.max_pages = 500
+            self.page_ms = 200
+            self.ack_ms = 800
+            self.display_mode = "tkinter"
+            self.display = FakeDisplay()
+            self.target = ("192.168.21.14", 8888)
+            self.disable_bulk = True
+            self.bulk_threshold = 400
+            self.bulk_chunk = 2900
+
+        def log(self, msg):
+            pass
+
+        def log_req(self, level, phase, message, req_id):
+            pass
+
+        def parse_request(self, text):
+            raise AssertionError("a MISSING signal must not be parsed as a request")
+
+        def cleanup(self):
+            pass
+
+        def observe_completed_clipboard(self, req_id):
+            return False
+
+        def _is_cancelled(self, req_id):
+            return False
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError("MISSING replay must not re-forward or re-encode")
+
+    ns = {
+        "json": json,
+        "time": _time,
+        "threading": __import__("threading"),
+        "PROTOCOL_VERSION": "qrtunnel-qr-1",
+        "VERSION": "0.5.0-dev",
+        "is_probe_request": lambda req: False,
+        "build_probe_response": lambda: (200, [], b""),
+        "show_ack": lambda req_id, hold_ms: acks.append(req_id),
+        "show_stopped": lambda req_id, hold_ms: None,
+        "encode_response": _forbidden,
+        "_compress_plan": lambda body, chunk_bytes: (body, False, 1),
+        "_select_transfer_plan": lambda *a, **k: (False, 2800, 1, 1),
+        "_write_summary": lambda upd: summaries.append(upd),
+        "ForwardControl": lambda: None,
+        "forward_request": _forbidden,
+        "get_screen_size": lambda: (1920, 1080),
+        "_parse_missing_signal": parse_missing,
+    }
+    exec(compile(tail, "<_play_and_finalize>", "exec"), ns)
+    FakeSelf._play_and_finalize = ns["_play_and_finalize"]
+    exec(compile(code, "<_process_request>", "exec"), ns)
+
+    fake = FakeSelf()
+    ns["_process_request"](fake, "QRT:MISSING:rid-9:0", True)
+    assert acks == ["rid-9"], acks
+    assert played == [["meta", "data"]], played
+    entry = fake._replay
+    assert entry["last_replay_at"] > 0, "replay must refresh the rate-limit stamp"
+    assert any(s.get("replay_trigger") == "missing" for s in summaries), summaries
+    assert any(s.get("status") == "completed" for s in summaries), summaries
+
+    # Same signal with no cache (e.g. B-end restarted) must be ignored safely.
+    fake2 = FakeSelf()
+    fake2._replay = None
+    summaries.clear()
+    ns["_process_request"](fake2, "QRT:MISSING:rid-9:0", True)
+    assert len(summaries) == 0
+    print("test_missing_replay_path_uses_cached_pages OK")
+
+
+def test_playback_min_time_before_no_missing():
+    """B-end must not read "no MISSING" as "A-end is done" before it has played
+    at least min_play_s: A-end only writes MISSING after decoding the ACK, and
+    that decode was measured 2.4-3.4s late in the field."""
+    min_play = extract_constant(B_SRC, "MIN_PLAY_BEFORE_NO_MISSING_S")
+    assert min_play >= 4.0, min_play
+    body = extract_function(B_SRC, "show_pages")
+    assert "played_long_enough" in body, "show_pages must gate no_missing on play time"
+    # The gate must be consulted before the no_missing conclusion is taken.
+    gate_at = body.index("elif not played_long_enough():")
+    conclude_at = body.index("stop = self._check_stop(req_id) or \"no_missing\"")
+    assert gate_at < conclude_at, "play-time gate must precede the no_missing stop"
+    print("test_playback_min_time_before_no_missing OK")
+
+
 def test_compose_frame():
     """Per-frame compose (render-speedup building block) must produce one
     canvas with every QR centered in its cell and empty cells left black."""
@@ -953,8 +1144,12 @@ def main():
     test_probe_and_426_local_response_no_crash()
     test_replay_rewrite_detection()
     test_replay_path_uses_cached_pages()
+    test_missing_signal_replay_detection()
+    test_missing_replay_path_uses_cached_pages()
+    test_playback_min_time_before_no_missing()
     test_wait_clipboard_returns_named_item()
     test_run_loop_consumes_request()
+    test_b_summary_stale_field_reset()
     test_compose_frame()
     print("ALL TESTS PASSED")
 

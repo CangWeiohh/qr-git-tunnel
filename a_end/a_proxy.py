@@ -156,7 +156,7 @@ def _write_summary(update):
             # values from the previous request never leak into this one.
             for key in ("http_status", "response_bytes", "elapsed_seconds",
                         "failure_reason", "terminal_reason", "qr_pages",
-                        "bulk", "bulk_chunk"):
+                        "bulk", "bulk_chunk", "consecutive_ack_failures"):
                 _last_summary.pop(key, None)
         _last_summary = {**_last_summary, **update, "version": VERSION, "role": "A", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
         try:
@@ -1296,7 +1296,7 @@ def wait_for_target_window(timeout=None, poll_interval=0.5, log_interval=30.0):
         time.sleep(max(0.05, poll_interval))
 
 
-def run_probe(ack_wait=3.0, max_attempts=4, wait_timeout=30.0):
+def run_probe(ack_wait=4.5, max_attempts=4, wait_timeout=30.0):
     """Send one internal probe request through the QR channel and record the
     B-end capability. Returns the parsed capability dict (or a legacy marker).
 
@@ -1644,7 +1644,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # attempt so RDP treats it as a fresh clipboard update; B-end dedupes
             # by req_id so repeated deliveries are harmless.
             max_attempts = 8
-            ack_wait = 3.0
+            # Observed QR round trip (request -> B-end ACK -> A-end decode) runs
+            # 1.5-3.5s in the field, so a 3.0s wait made A-end rewrite the request
+            # on many otherwise-fine transfers (4/62 on 2026-09-17 evening). 4.5s
+            # keeps a margin over the slow cases; a late ACK is still accepted at
+            # the start of the next attempt.
+            ack_wait = 4.5
             acked = False
             for attempt in range(1, max_attempts + 1):
                 req["retry"] = attempt
@@ -1780,9 +1785,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             # Prefer explicit two-phase confirmation: new B-end clears old DONE
             # before showing STOPPED as its final action. For compatibility with
-            # old B-end builds (no STOPPED), retain a conservative 2.2s fallback.
-            log_event("INFO", "STOP", "waiting for B-end STOPPED confirmation (fallback 2.2s)", req_id)
-            stop_deadline = time.time() + 2.2
+            # old B-end builds (no STOPPED), retain a conservative fallback.
+            # 3.5s: the STOPPED QR was seen only after the old 2.2s window in 8 of
+            # 62 transfers on 2026-09-17 evening (the decode pipeline lags 2-3s),
+            # so a 2.2s fallback warned on cases that were actually fine.
+            log_event("INFO", "STOP", "waiting for B-end STOPPED confirmation (fallback 3.5s)", req_id)
+            stop_deadline = time.time() + 3.5
             while time.time() < stop_deadline:
                 if tracker.has_stopped(req_id):
                     break

@@ -145,9 +145,13 @@ def _write_summary(update):
         if update.get("status") == "in_progress":
             # A new request starts: drop per-request result fields so stale
             # values from the previous request never leak into this one.
+            # "replay"/"replay_trigger" must be cleared too: they are set when a
+            # rewrite is answered from cache, and without this the flag stuck on
+            # every later summary (7 history entries claimed replay on
+            # 2026-09-17 evening when only one request actually replayed).
             for key in ("http_status", "response_bytes", "elapsed_seconds",
                         "failure_reason", "terminal_reason", "qr_pages",
-                        "bulk", "bulk_chunk"):
+                        "bulk", "bulk_chunk", "replay", "replay_trigger"):
                 _last_summary.pop(key, None)
         _last_summary = {**_last_summary, **update, "version": VERSION, "role": "B", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
         try:
@@ -551,6 +555,55 @@ REPLAY_WINDOW_S = 120.0
 # every request and spin at 100% CPU (field incident 2026-09-17 19:11).
 ClipboardItem = namedtuple("ClipboardItem", "kind text")
 
+# A-end rewrites QRT:MISSING every ~500ms while it is still collecting pages.
+# When such a signal arrives for a request B-end already finished playing, A-end
+# is telling us it never decoded the playback — replay from cache, but no more
+# often than this, or a dead screen would make B-end churn Tk windows at 2Hz.
+MISSING_REPLAY_MIN_INTERVAL_S = 2.0
+
+# Minimum playback time before "no MISSING signal" may be read as "A-end is
+# done". A-end writes MISSING only AFTER it decodes the ACK, and the ACK decode
+# was measured 2.4-3.4s late in the field; stopping earlier made B-end give up
+# while A-end was still waiting (failed push 2026-09-17 19:25).
+MIN_PLAY_BEFORE_NO_MISSING_S = 4.5
+
+
+def _parse_missing_signal(text):
+    """Return (req_id, pages_str) for a QRT:MISSING clipboard line, else None."""
+    if not text or not text.startswith("QRT:MISSING:"):
+        return None
+    body = text[len("QRT:MISSING:"):]
+    if ":" not in body:
+        return None
+    req_id, pages = body.rsplit(":", 1)
+    req_id, pages = req_id.strip(), pages.strip()
+    if not req_id or not pages:
+        return None
+    return req_id, pages
+
+
+def _is_replay_missing(entry, req_id, now=None, window=REPLAY_WINDOW_S,
+                       min_interval=MISSING_REPLAY_MIN_INTERVAL_S):
+    """Decide whether a MISSING signal means "A-end is still waiting for a
+    response we already finished playing" and deserves a replay.
+
+    Rate-limited by ``min_interval`` so a permanently blank screen cannot make
+    B-end rebuild its windows on every 500ms signal.
+    """
+    if not entry or not req_id or not entry.get("pages"):
+        return False
+    if entry.get("req_id") != req_id:
+        return False
+    if now is None:
+        now = time.time()
+    try:
+        if now - float(entry.get("ts") or 0) > float(window):
+            return False
+        last_replay = float(entry.get("last_replay_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (now - last_replay) >= float(min_interval)
+
 
 def _is_replay_rewrite(entry, req, now=None, window=REPLAY_WINDOW_S):
     """Decide whether a parsed request is a fresh retry of the cached response.
@@ -594,12 +647,15 @@ class QRDisplay:
     received yet.
     """
 
-    def __init__(self, page_ms=200, loops=3, max_qr=0, min_box_size=2, max_extra_rounds=8):
+    def __init__(self, page_ms=200, loops=3, max_qr=0, min_box_size=2,
+                 max_extra_rounds=8, min_play_s=MIN_PLAY_BEFORE_NO_MISSING_S):
         self.page_ms = page_ms
         self.loops = loops
         self.max_qr = max_qr  # 0 = auto-calculate
         self.min_box_size = min_box_size
         self.max_extra_rounds = max_extra_rounds  # backfill rounds after fixed loops
+        # Play at least this long before "no MISSING" may stop the playback.
+        self.min_play_s = min_play_s
 
     def _calc_grid(self, sw, sh, item_count=None):
         """Calculate grid (cols, rows) and box_size for multi-QR display.
@@ -972,6 +1028,11 @@ class QRDisplay:
                         return
 
         # ---- Primary loops: first round plays all pages, later rounds only missing ----
+        play_started = time.monotonic()
+
+        def played_long_enough():
+            return (time.monotonic() - play_started) >= self.min_play_s
+
         for loop_num in range(self.loops):
             if stop or stop_manual:
                 break
@@ -982,6 +1043,17 @@ class QRDisplay:
                 if missing is not None:
                     play_indices = sorted(missing)
                     blog_event("INFO", "DISPLAY", f"loop {loop_num + 1}/{self.loops}: playing {len(play_indices)} missing pages", req_id)
+                elif not played_long_enough():
+                    # Too early to read "no MISSING" as "A-end is done": A-end
+                    # only starts writing MISSING after it decodes the ACK, which
+                    # can lag several seconds. Keep playing rather than stopping
+                    # while A-end is still waiting (see MIN_PLAY_BEFORE_NO_MISSING_S).
+                    play_indices = all_indices
+                    blog_event("INFO", "DISPLAY",
+                               f"loop {loop_num + 1}/{self.loops}: no MISSING yet but only "
+                               f"{time.monotonic() - play_started:.1f}s played "
+                               f"(< {self.min_play_s}s); A-end may still be decoding the ACK, "
+                               f"replaying all pages", req_id)
                 elif self._no_missing_grace(req_id, len(payloads)):
                     # A-end writes MISSING every ~500ms while it waits. Its
                     # absence means the request finished (DONE) or A-end gave up
@@ -1023,10 +1095,10 @@ class QRDisplay:
                 play_indices = sorted(missing)
                 blog_event("INFO", "DISPLAY", f"backfill {extra_rounds + 1}: playing {len(play_indices)} missing pages", req_id)
             else:
-                # No MISSING signal — A-end finished (DONE) or is gone (CANCEL).
-                # Confirm over ~0.6s (A-end rewrites MISSING every ~500ms), then
-                # stop instead of replaying the entire response again and again.
-                if self._no_missing_grace(req_id, len(payloads)):
+                # No MISSING signal — A-end finished (DONE) or is gone (CANCEL),
+                # but never conclude that before the minimum play time: A-end may
+                # still be decoding the ACK and not writing MISSING yet.
+                if played_long_enough() and self._no_missing_grace(req_id, len(payloads)):
                     stop = self._check_stop(req_id) or "no_missing"
                     blog_event("INFO", "DISPLAY", "backfill: no MISSING; A-end no longer waiting, stopping", req_id)
                     break
@@ -1386,11 +1458,13 @@ class BTunnel:
     def wait_clipboard(self, poll_ms=200):
         """Wait until a valid QRT:b64 request is present.
 
-        Returns a :class:`ClipboardItem` whose ``kind`` is ``"new"`` for a
-        request that has not been processed yet, or ``"replay"`` when A-end is
-        rewriting an already-processed request because it never saw the ACK QR
-        (B->A screen glitch while the A->B clipboard stayed alive) — see
-        _is_replay_rewrite. ``text`` is the raw ``QRT:b64:`` clipboard string.
+        Returns a :class:`ClipboardItem` whose ``kind`` is:
+        ``"new"``       — a request that has not been processed yet;
+        ``"replay"``    — A-end rewrote an already-processed request because it
+                          never saw the ACK QR (see _is_replay_rewrite);
+        ``"replay_missing"`` — A-end is still reporting missing pages for a
+                          request we already finished (see _is_replay_missing).
+        ``text`` is the raw clipboard string (``QRT:b64:...`` or ``QRT:MISSING:...``).
 
         B-end is strictly READ-ONLY on the clipboard. Control states
         (DONE/CANCEL/MISSING/IDLE), stale requests and unrelated user clipboard
@@ -1407,6 +1481,16 @@ class BTunnel:
 
         def classify(text):
             """Return a ClipboardItem, or None for anything not worth handling."""
+            if text.startswith("QRT:MISSING:"):
+                # A-end is still missing pages of a request we already finished:
+                # it never decoded our playback (typically it only got the ACK
+                # after the display had stopped). Replay from cache, rate-limited
+                # so a permanently blank screen cannot churn Tk windows at 2Hz.
+                parsed = _parse_missing_signal(text)
+                if parsed and _is_replay_missing(self._replay, parsed[0]):
+                    self._replay["last_replay_at"] = time.time()
+                    return ClipboardItem("replay_missing", text)
+                return None
             if not text.startswith("QRT:b64:"):
                 return None
             req = self.parse_request(text)
@@ -1426,6 +1510,7 @@ class BTunnel:
                 except (TypeError, ValueError):
                     pass
                 self._replay["ts"] = time.time()
+                self._replay["last_replay_at"] = time.time()
                 return ClipboardItem("replay", text)
             return None
 
@@ -1434,7 +1519,7 @@ class BTunnel:
             blog_event("INFO", "CLIP",
                        f"request already present when waiting started; "
                        f"bytes={len(present.text)}"
-                       + (" (replay of processed request)" if present.kind == "replay" else ""))
+                       + (f" ({present.kind})" if present.kind != "new" else ""))
             return present
 
         poll_count = 0
@@ -1453,6 +1538,10 @@ class BTunnel:
                 if present.kind == "replay":
                     blog_event("INFO", "CLIP",
                                f"rewrite of processed request for replay: bytes={len(present.text)}")
+                elif present.kind == "replay_missing":
+                    blog_event("INFO", "CLIP",
+                               f"MISSING feedback for a finished request; will replay: "
+                               f"{present.text[:60]}")
                 else:
                     blog_event("INFO", "CLIP",
                                f"new request on clipboard: bytes={len(present.text)}")
@@ -1594,7 +1683,7 @@ class BTunnel:
                 else:
                     same_text_streak = 0
                     last_text = item.text
-                self._process_request(item.text, replay=(item.kind == "replay"))
+                self._process_request(item.text, replay=(item.kind != "new"))
             except Exception as exc:
                 import traceback
                 blog_event("ERROR", "MAIN", f"unexpected error: {exc!r}; continuing", None)
@@ -1616,6 +1705,44 @@ class BTunnel:
         if text and text.startswith("QRT:CANCEL:"):
             cancel_id = text[len("QRT:CANCEL:"):]
             self.log(f"Cancel signal received for req={cancel_id[:8]}... (no active display)")
+            return
+
+        # A-end is still reporting missing pages for a request we already
+        # finished playing: it never decoded our playback (typically it only
+        # decoded the ACK after the display had already stopped, so it started
+        # collecting too late). Replay the cached response instead of ignoring
+        # the signal as stale — that deadlock lost a push on 2026-09-17 19:25,
+        # where A-end's QRT:MISSING sat on the clipboard for 55s while B-end
+        # concluded "no MISSING means A-end is done".
+        if replay and text and text.startswith("QRT:MISSING:"):
+            parsed = _parse_missing_signal(text)
+            req_id = parsed[0] if parsed else ""
+            entry = self._replay
+            if (not entry or not req_id or entry.get("req_id") != req_id
+                    or not entry.get("pages")):
+                self.log(f"MISSING replay for {(req_id or '?')[:8]}... but no cached response; ignoring")
+                return
+            entry["ts"] = time.time()
+            entry["last_replay_at"] = time.time()
+            pages = entry["pages"]
+            self.log_req("INFO", "REQ",
+                         f"MISSING feedback (pages {parsed[1]}) for a finished request — "
+                         f"A-end still waiting; replaying cached response "
+                         f"({len(pages)} pages)", req_id)
+            _write_summary({
+                "status": "in_progress",
+                "request_id": req_id,
+                "replay": True,
+                "replay_trigger": "missing",
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            })
+            self.log_req("INFO", "ACK", "re-showing ACK; replaying cached response", req_id)
+            try:
+                show_ack(req_id, self.ack_ms)
+            except Exception as e:
+                self.log_req("ERROR", "ACK", f"display failed: {e}", req_id)
+            time.sleep(0.1)
+            self._play_and_finalize(req_id, pages, bool(entry.get("is_probe")))
             return
 
         # Stale DONE signal (for a request we already finished playing) — ignore.
@@ -1657,6 +1784,7 @@ class BTunnel:
                 return
             entry["retry"] = max(int(entry.get("retry") or 0), retry)
             entry["ts"] = time.time()
+            entry["last_replay_at"] = time.time()
             pages = entry["pages"]
             self.log_req("INFO", "REQ",
                          f"{req.get('method', 'GET')} {req.get('path', '/')} "
@@ -1668,6 +1796,7 @@ class BTunnel:
                 "method": req.get("method", "GET"),
                 "path": req.get("path", "/"),
                 "replay": True,
+                "replay_trigger": "rewrite",
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             })
             # ACK first: A-end only starts collecting pages after it decodes one.
@@ -1843,9 +1972,12 @@ class BTunnel:
         # Keep the encoded response briefly: if A-end never decodes the ACK or
         # the pages it rewrites the same request, and wait_clipboard() turns that
         # rewrite into a replay of exactly these pages (no re-forward to the
-        # intranet git server, so a replayed push cannot run twice).
+        # intranet git server, so a replayed push cannot run twice). The same
+        # cache answers a QRT:MISSING for this request (A-end collected nothing),
+        # hence is_probe/last_replay_at for correct summary status and rate limit.
         self._replay = {"req_id": req_id, "pages": pages,
-                        "ts": time.time(), "retry": retry}
+                        "ts": time.time(), "retry": retry,
+                        "is_probe": is_probe, "last_replay_at": 0.0}
         summary_update = {
             "status": "displaying",
             "request_id": req_id,
