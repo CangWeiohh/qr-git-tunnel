@@ -26,6 +26,7 @@ import tempfile
 import logging
 import logging.handlers
 import threading
+from collections import namedtuple
 from pathlib import Path
 from http.client import HTTPConnection
 
@@ -544,6 +545,11 @@ def show_stopped(req_id, hold_ms=500):
 # the last encoded response briefly and replays ACK + pages when it sees a
 # newer retry of that same request.
 REPLAY_WINDOW_S = 120.0
+
+# wait_clipboard() result. Named so callers read ``item.kind`` / ``item.text``
+# instead of unpacking positionally — a swapped unpack once made B-end ignore
+# every request and spin at 100% CPU (field incident 2026-09-17 19:11).
+ClipboardItem = namedtuple("ClipboardItem", "kind text")
 
 
 def _is_replay_rewrite(entry, req, now=None, window=REPLAY_WINDOW_S):
@@ -1380,10 +1386,11 @@ class BTunnel:
     def wait_clipboard(self, poll_ms=200):
         """Wait until a valid QRT:b64 request is present.
 
-        Returns ``(kind, text)`` where kind is ``"new"`` for a request that has
-        not been processed yet, or ``"replay"`` when A-end is rewriting an
-        already-processed request because it never saw the ACK QR (B->A screen
-        glitch while the A->B clipboard stayed alive) — see _is_replay_rewrite.
+        Returns a :class:`ClipboardItem` whose ``kind`` is ``"new"`` for a
+        request that has not been processed yet, or ``"replay"`` when A-end is
+        rewriting an already-processed request because it never saw the ACK QR
+        (B->A screen glitch while the A->B clipboard stayed alive) — see
+        _is_replay_rewrite. ``text`` is the raw ``QRT:b64:`` clipboard string.
 
         B-end is strictly READ-ONLY on the clipboard. Control states
         (DONE/CANCEL/MISSING/IDLE), stale requests and unrelated user clipboard
@@ -1399,7 +1406,7 @@ class BTunnel:
             last = ""
 
         def classify(text):
-            """Return (kind, text) for a fresh request or a rewrite to replay."""
+            """Return a ClipboardItem, or None for anything not worth handling."""
             if not text.startswith("QRT:b64:"):
                 return None
             req = self.parse_request(text)
@@ -1409,7 +1416,7 @@ class BTunnel:
             if not req_id:
                 return None
             if req_id not in self.processed:
-                return ("new", text)
+                return ClipboardItem("new", text)
             # Same request id as one we already finished: accept it only when
             # A-end bumped its retry counter, i.e. it is still waiting for an
             # ACK/pages that never reached the screen.
@@ -1419,16 +1426,15 @@ class BTunnel:
                 except (TypeError, ValueError):
                     pass
                 self._replay["ts"] = time.time()
-                return ("replay", text)
+                return ClipboardItem("replay", text)
             return None
 
         present = classify(last)
         if present:
-            kind, body = present
             blog_event("INFO", "CLIP",
                        f"request already present when waiting started; "
-                       f"bytes={len(body)}"
-                       + (" (replay of processed request)" if kind == "replay" else ""))
+                       f"bytes={len(present.text)}"
+                       + (" (replay of processed request)" if present.kind == "replay" else ""))
             return present
 
         poll_count = 0
@@ -1444,13 +1450,12 @@ class BTunnel:
 
             present = classify(cur)
             if present:
-                kind, body = present
-                if kind == "replay":
+                if present.kind == "replay":
                     blog_event("INFO", "CLIP",
-                               f"rewrite of processed request for replay: bytes={len(body)}")
+                               f"rewrite of processed request for replay: bytes={len(present.text)}")
                 else:
                     blog_event("INFO", "CLIP",
-                               f"new request on clipboard: bytes={len(body)}")
+                               f"new request on clipboard: bytes={len(present.text)}")
                 return present
 
             # Everything other than a fresh QRT:b64 request is an idle/control
@@ -1570,10 +1575,26 @@ class BTunnel:
             self.log(f"Initial clipboard read failed, will retry: {exc}")
             last_text = ""
 
+        # Progress guard for the request loop (see the comment inside).
+        same_text_streak = 0
         while True:
             try:
-                text, kind = self.wait_clipboard()
-                self._process_request(text, replay=(kind == "replay"))
+                item = self.wait_clipboard()
+                # Defensive: a request that keeps being returned but is never
+                # consumed would spin this loop at 100% CPU and B-end would play
+                # nothing at all (field incident 2026-09-17 19:11, caused by a
+                # swapped (kind, text) unpack). Back off instead of burning CPU.
+                if item.text == last_text:
+                    same_text_streak += 1
+                    if same_text_streak >= 3:
+                        blog_event("WARN", "CLIP",
+                                   f"same request returned {same_text_streak} times "
+                                   f"without progress; backing off")
+                        time.sleep(0.5)
+                else:
+                    same_text_streak = 0
+                    last_text = item.text
+                self._process_request(item.text, replay=(item.kind == "replay"))
             except Exception as exc:
                 import traceback
                 blog_event("ERROR", "MAIN", f"unexpected error: {exc!r}; continuing", None)

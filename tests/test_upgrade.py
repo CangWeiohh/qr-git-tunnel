@@ -754,6 +754,144 @@ def test_replay_path_uses_cached_pages():
     print("test_replay_path_uses_cached_pages OK")
 
 
+def test_run_loop_consumes_request():
+    """Regression: run() must hand the clipboard *request text* to
+    _process_request.
+
+    A swapped (kind, text) unpack made run() pass the literal string "new" to
+    _process_request, which rejected it as non-QRT content; the request was then
+    never marked processed, so wait_clipboard() returned it again immediately and
+    B-end spun at 100% CPU playing no QR at all (field incident 2026-09-17
+    19:11: "连二维码都不会播放了"). This drives the real run() loop so the
+    hand-off is verified instead of assumed.
+    """
+    import base64 as _b64
+    import json as _json
+    import threading as _threading
+    from collections import namedtuple as _namedtuple
+
+    req = {"id": "aaaa1111-2222-3333-4444-555566667777", "method": "GET",
+           "path": "/repo/info/refs", "headers": [], "body": None, "retry": 1,
+           "protocol": "qrtunnel-qr-1", "client_version": "0.5.0-dev"}
+    request_text = "QRT:b64:" + _b64.b64encode(
+        _json.dumps(req).encode("utf-8")).decode("ascii")
+
+    clipboard = {"text": request_text}
+    seen = []
+
+    class StopLoop(BaseException):
+        """Not an Exception: run() catches Exception and would keep looping."""
+
+    class FakeSelf:
+        def __init__(self):
+            self.processed = {}
+            self._replay = None
+            self.chunk_bytes = 2800
+            self.page_ms = 300
+            self.display_mode = "tkinter"
+            self.target = ("192.168.21.14", 8888)
+            self.disable_bulk = True
+            self.bulk_threshold = 400
+            self.bulk_chunk = 2900
+
+        def log(self, msg):
+            pass
+
+        def parse_request(self, text):
+            if not text.startswith("QRT:b64:"):
+                return None
+            try:
+                return _json.loads(_b64.b64decode(text[8:]))
+            except Exception:
+                return None
+
+        def _process_request(self, text, replay=False):
+            seen.append((text, replay))
+            raise StopLoop()
+
+    ns = {
+        "time": _time,
+        "json": _json,
+        "base64": _b64,
+        "threading": _threading,
+        "IDLE_MARKER": "QRT:IDLE",
+        "REPLAY_WINDOW_S": extract_constant(B_SRC, "REPLAY_WINDOW_S"),
+        "ClipboardItem": _namedtuple("ClipboardItem", "kind text"),
+        "blog_event": lambda *a, **k: None,
+        "get_clipboard_text": lambda: clipboard["text"],
+    }
+    for name in ("_is_replay_rewrite", "wait_clipboard", "run"):
+        exec(compile(extract_function(B_SRC, name), f"<{name}>", "exec"), ns)
+    # run() calls self.wait_clipboard(): bind the real extracted function so the
+    # loop exercises the real classify/hand-off path (an unbound attribute would
+    # be swallowed by run()'s except-Exception and spin forever).
+    FakeSelf.wait_clipboard = ns["wait_clipboard"]
+
+    fake = FakeSelf()
+    try:
+        ns["run"](fake)
+    except StopLoop:
+        pass
+
+    assert seen, "run() never reached _process_request"
+    text, replay = seen[0]
+    assert text == request_text, (
+        "run() passed %r to _process_request instead of the clipboard request "
+        "(swapped kind/text unpack?)" % (text[:40],)
+    )
+    assert replay is False, "a fresh request must not be flagged as a replay"
+    print("test_run_loop_consumes_request OK")
+
+
+def test_wait_clipboard_returns_named_item():
+    """wait_clipboard() must expose kind/text by name so callers cannot swap a
+    positional unpack (the 2026-09-17 19:11 regression)."""
+    import base64 as _b64
+    import json as _json
+    import threading as _threading
+    from collections import namedtuple as _namedtuple
+
+    req = {"id": "bbbb1111-2222-3333-4444-555566667777", "method": "GET",
+           "path": "/repo/info/refs", "headers": [], "body": None, "retry": 1}
+    request_text = "QRT:b64:" + _b64.b64encode(
+        _json.dumps(req).encode("utf-8")).decode("ascii")
+
+    clipboard = {"text": request_text}
+
+    class FakeSelf:
+        def __init__(self):
+            self.processed = {}
+            self._replay = None
+
+        def parse_request(self, text):
+            if not text.startswith("QRT:b64:"):
+                return None
+            try:
+                return _json.loads(_b64.b64decode(text[8:]))
+            except Exception:
+                return None
+
+    ns = {
+        "time": _time,
+        "json": _json,
+        "base64": _b64,
+        "threading": _threading,
+        "IDLE_MARKER": "QRT:IDLE",
+        "REPLAY_WINDOW_S": extract_constant(B_SRC, "REPLAY_WINDOW_S"),
+        "ClipboardItem": _namedtuple("ClipboardItem", "kind text"),
+        "blog_event": lambda *a, **k: None,
+        "get_clipboard_text": lambda: clipboard["text"],
+    }
+    for name in ("_is_replay_rewrite", "wait_clipboard"):
+        exec(compile(extract_function(B_SRC, name), f"<{name}>", "exec"), ns)
+
+    item = ns["wait_clipboard"](FakeSelf(), poll_ms=1)
+    assert item.kind == "new", item.kind
+    assert item.text == request_text, item.text
+    assert tuple(item) == ("new", request_text)
+    print("test_wait_clipboard_returns_named_item OK")
+
+
 def test_compose_frame():
     """Per-frame compose (render-speedup building block) must produce one
     canvas with every QR centered in its cell and empty cells left black."""
@@ -815,6 +953,8 @@ def main():
     test_probe_and_426_local_response_no_crash()
     test_replay_rewrite_detection()
     test_replay_path_uses_cached_pages()
+    test_wait_clipboard_returns_named_item()
+    test_run_loop_consumes_request()
     test_compose_frame()
     print("ALL TESTS PASSED")
 
